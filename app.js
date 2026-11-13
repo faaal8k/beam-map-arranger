@@ -1491,7 +1491,7 @@ function buildDemoTer() {
   const buf = new ArrayBuffer(5 + SIZE * SIZE * 2);
   const v = new DataView(buf);
   v.setUint8(0, ver); v.setUint32(1, SIZE, true);
-  new Uint16Array(buf, 5).set(hm);
+  new Uint8Array(buf).set(new Uint8Array(hm.buffer, hm.byteOffset, hm.byteLength), 5);
   return new File([buf], 'levels/test_arranger/terrain.ter');
 }
 function buildDemoFiles() {
