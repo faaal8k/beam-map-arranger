@@ -1,4 +1,5 @@
 import * as THREE from './vendor/three.module.min.js';
+import { AssetStore, yieldUI, dirOf, avgColor } from './assets.js';
 
 const $ = id => document.getElementById(id);
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -19,7 +20,9 @@ const S = {
   undo: [], redo: [], zipFiles: null, dae: new Map(),
   addType: 'TSStatic', filter: '', autoZ: false, adding: false,
   mode: '3d', show: { ts: true, rd: true, ot: true, grid: true, names: false },
-  clipboard: null, shapeSel: '', roadMat: 'road_asphalt_2lane'
+  clipboard: null, shapeSel: '', roadMat: 'road_asphalt_2lane',
+  assets: null, assetGen: 0, shapeByName: new Map(), roadMats: new Map(), terTex: null, terLayers: null,
+  astat: null
 };
 
 const isPlaced = r => Array.isArray(r.position) && PLACED.includes(r.class);
@@ -110,14 +113,22 @@ async function loadFiles(list) {
         if (!tf) tf = e;
       }
       if (tf) S.ter = parseTer(await readBuf(tf));
+      if (S.ter && !S.ter.mats.length) {
+        for (const [p, e] of raw) {
+          if (!/\.terrain\.json$/i.test(p)) continue;
+          try { const j = JSON.parse(await readText(e)); if (Array.isArray(j.materials)) { S.ter.mats = j.materials.map(String); break; } } catch (_) {}
+        }
+      }
     }
     await loadDaeBounds();
     $('intro').style.display = 'none';
     rebuildObjs();
+    terrainDirty = true;
     rebuildMeshes();
     fit();
     S.sel = null; renderSheet(); render();
     toast('تم: ' + S.objs.length + ' عنصر' + (S.ter ? ' + تضاريس ' + S.ter.size + '×' + S.ter.size : ' (بدون ملف .ter)'));
+    S.realLoading = startRealLoad();
   } catch (e) { if (msg) msg.textContent = 'خطأ: ' + e.message; else alert(e.message); }
 }
 
@@ -126,7 +137,22 @@ function parseTer(buf) {
   if (ver < 7 || ver > 9) throw new Error('نسخة .ter غير مدعومة: ' + ver);
   const size = v.getUint32(1, true);
   const hm = new Uint16Array(buf.slice(5, 5 + size * size * 2));
-  return { size, hm, ver };
+  // layer map (one material index per vertex, 255 = hole) + material names
+  let layer = null, mats = [];
+  let off = 5 + size * size * 2;
+  if (buf.byteLength >= off + size * size) {
+    layer = new Uint8Array(buf.slice(off, off + size * size)); off += size * size;
+    try {
+      if (buf.byteLength >= off + 4) {
+        const n = v.getUint32(off, true); off += 4;
+        if (n > 0 && n < 256) for (let i = 0; i < n && off < buf.byteLength; i++) {
+          const len = v.getUint8(off); off += 1;
+          mats.push(new TextDecoder().decode(new Uint8Array(buf, off, Math.min(len, buf.byteLength - off)))); off += len;
+        }
+      }
+    } catch (_) { mats = []; }
+  }
+  return { size, hm, ver, layer, mats };
 }
 function T() {
   const b = S.block; if (!b || !S.ter) return null;
@@ -181,6 +207,146 @@ async function loadDaeBounds() {
       S.dae.set(nm, b);
     } catch (_) {}
   }
+}
+
+/* ---------- real look: shapes, materials, terrain layers ---------- */
+const SHAPED = new Set(['TSStatic', 'TSForestItemData']);
+const shapeRef = o => SHAPED.has(o.cls) ? (o.r.shapeName || o.r.shapeFile || '') : '';
+function levelRoot(p) { const m = /^(.*?(?:^|\/)levels\/[^/]+)/i.exec(String(p).replace(/\\/g, '/')); return m ? m[1] : dirOf(p); }
+const isPhone = () => Math.min(viewW, viewH) < 700 || coarse;
+let terrainDirty = true, realRebuildT = 0;
+function scheduleRealRebuild(now) {
+  clearTimeout(realRebuildT);
+  const run = () => { if (pts.size || gesturing) { realRebuildT = setTimeout(run, 250); return; } rebuildMeshes(); render(); };
+  if (now) run(); else realRebuildT = setTimeout(run, 220);
+}
+function setAssetStatus() {
+  const a = S.astat, el = $('assetStatus'); if (!el) return;
+  if (!a) { el.hidden = true; return; }
+  let h = '';
+  if (a.loading) h += `<span class="spin"></span> جاري تحميل الأشكال الحقيقية <span class="n">${a.done}/${a.total}</span>`;
+  else if (a.total) h += `أشكال حقيقية: <span class="n">${a.found}/${a.total}</span> ملف`;
+  else h += 'لا توجد ملفات أشكال';
+  if (a.total && (a.missing || a.failed)) h += ` · <b>${a.missing + a.failed}</b> صندوق` + (a.missing ? ` (${a.missing} غير موجود بالملف)` : '') + (a.failed ? ` (${a.failed} تعذّرت قراءته)` : '');
+  if (a.tex) h += ` · خامات <span class="n">${a.tex.found}/${a.tex.found + a.tex.missing + a.tex.failed}</span>` + (a.tex.bc7 ? ` (${a.tex.bc7} بصيغة BC7 غير مدعومة)` : '');
+  if (a.terrain) h += ` · أرض: ${a.terrain}`;
+  el.innerHTML = h; el.hidden = false; placeStatus();
+}
+function placeStatus() {
+  const el = $('assetStatus'), hd = $('hud'); if (!el || el.hidden || !hd) return;
+  el.style.top = (hd.offsetTop + hd.offsetHeight + 6) + 'px';
+}
+const GUESS = [[/grass|lawn|meadow|field/i, [0.33, 0.45, 0.2]], [/sand|beach|desert/i, [0.76, 0.68, 0.5]], [/rock|cliff|stone|gravel/i, [0.5, 0.48, 0.45]],
+  [/dirt|mud|soil|ground/i, [0.45, 0.36, 0.25]], [/asphalt|road|tarmac/i, [0.22, 0.22, 0.23]], [/snow|ice/i, [0.92, 0.94, 0.97]], [/forest|leaf|moss/i, [0.24, 0.34, 0.16]], [/concrete|cement/i, [0.62, 0.62, 0.6]]];
+const PAL = [[0.36, 0.46, 0.24], [0.5, 0.42, 0.3], [0.52, 0.5, 0.47], [0.7, 0.64, 0.48], [0.3, 0.38, 0.2], [0.42, 0.33, 0.24]];
+function guessColor(nm, i) { for (const [re, c] of GUESS) if (re.test(nm)) return c; return PAL[i % PAL.length]; }
+
+async function bakeTerrain(st, gen) {
+  const t = T(); if (!t || !S.ter || !S.ter.layer) return null;
+  const root = levelRoot(S.block && S.block.terrainFile || (S.groups[0] && S.groups[0].path) || '');
+  const layers = [];
+  let withTex = 0;
+  for (let i = 0; i < Math.max(1, S.ter.mats.length); i++) {
+    const nm = S.ter.mats[i] || 'layer' + i;
+    const def = st.mats.terrain.get(nm.toLowerCase()) || null;
+    let px = null;
+    if (def && def.colorMap) px = await st.pixels(def.colorMap, [def.dir, root], 256);
+    if (gen !== S.assetGen) return null;
+    if (px) withTex++;
+    layers.push({ nm, px, avg: px ? avgColor(px) : (def && def.color ? def.color : guessColor(nm, i)), tile: def && def.tile > 0 ? def.tile : 8 });
+  }
+  S.terLayers = layers;
+  const N = Math.max(256, Math.min(isPhone() ? 1024 : 2048, 2 ** Math.ceil(Math.log2(t.ext / 0.1))));
+  const data = new Uint8Array(N * N * 4);
+  const L = S.ter.layer, sz = t.size;
+  const toLin = c => c; // sampling in sRGB space; the texture is tagged sRGB
+  const sample = (ly, x, y, out, w) => {
+    const l = layers[ly];
+    if (!l) return 0;
+    if (l.px) {
+      const u = ((x / l.tile) % 1 + 1) % 1, v = ((y / l.tile) % 1 + 1) % 1;
+      const k = (Math.min(l.px.h - 1, ((1 - v) * l.px.h) | 0) * l.px.w + Math.min(l.px.w - 1, (u * l.px.w) | 0)) * 4;
+      out[0] += l.px.data[k] * w; out[1] += l.px.data[k + 1] * w; out[2] += l.px.data[k + 2] * w;
+    } else { out[0] += toLin(l.avg[0]) * 255 * w; out[1] += toLin(l.avg[1]) * 255 * w; out[2] += toLin(l.avg[2]) * 255 * w; }
+    return w;
+  };
+  const acc = [0, 0, 0];
+  for (let j = 0; j < N; j++) {
+    const gy = Math.min(sz - 1.001, ((j + 0.5) / N) * (sz - 1)), y0 = gy | 0, fy = gy - y0;
+    const wy = t.py + ((j + 0.5) / N) * t.ext;
+    for (let i = 0; i < N; i++) {
+      const gx = Math.min(sz - 1.001, ((i + 0.5) / N) * (sz - 1)), x0 = gx | 0, fx = gx - x0;
+      const wx = t.px + ((i + 0.5) / N) * t.ext;
+      acc[0] = acc[1] = acc[2] = 0; let wsum = 0;
+      const a = L[y0 * sz + x0], b = L[y0 * sz + x0 + 1], c = L[(y0 + 1) * sz + x0], d = L[(y0 + 1) * sz + x0 + 1];
+      if (a === b && a === c && a === d) { if (a !== 255) wsum = sample(a, wx, wy, acc, 1); }
+      else {
+        if (a !== 255) wsum += sample(a, wx, wy, acc, (1 - fx) * (1 - fy));
+        if (b !== 255) wsum += sample(b, wx, wy, acc, fx * (1 - fy));
+        if (c !== 255) wsum += sample(c, wx, wy, acc, (1 - fx) * fy);
+        if (d !== 255) wsum += sample(d, wx, wy, acc, fx * fy);
+      }
+      const k = (j * N + i) * 4;
+      if (wsum > 0) { data[k] = acc[0] / wsum; data[k + 1] = acc[1] / wsum; data[k + 2] = acc[2] / wsum; }
+      else { data[k] = 90; data[k + 1] = 90; data[k + 2] = 90; }
+      data[k + 3] = 255;
+    }
+    if ((j & 63) === 63) { await yieldUI(); if (gen !== S.assetGen) return null; }
+  }
+  const tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.magFilter = THREE.LinearFilter; tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true; tex.anisotropy = isPhone() ? 4 : 8; tex.needsUpdate = true;
+  tex.onUpdate = () => { tex.image = { width: N, height: N, data: null }; };
+  S.astat.terrain = withTex ? `${withTex}/${layers.length} طبقة بخامتها` : `${layers.length} طبقة بألوان تقريبية`;
+  return tex;
+}
+
+async function ensureShape(o) {
+  const ref = shapeRef(o); if (!ref || !S.assets) { rebuildMeshes(); render(); return; }
+  if (!S.shapeByName.has(ref)) {
+    const res = await S.assets.shape(ref, [dirOf(o.g.path), levelRoot(o.g.path)]);
+    if (res && !res.error) { S.shapeByName.set(ref, res); S.dae.set(ref, res.bounds); }
+  }
+  rebuildMeshes(); renderSheet(true); render();
+}
+async function startRealLoad() {
+  const gen = ++S.assetGen;
+  if (S.assets) S.assets.dispose();
+  if (S.terTex) { S.terTex.dispose(); S.terTex = null; }
+  S.shapeByName = new Map(); S.roadMats = new Map(); S.terLayers = null;
+  const st = new AssetStore(S.zipFiles, isPhone()); S.assets = st;
+  const refs = new Map();
+  for (const o of S.objs) { const r = shapeRef(o); if (r && !refs.has(r)) refs.set(r, [dirOf(o.g.path), levelRoot(o.g.path)]); }
+  S.astat = { loading: true, total: refs.size, done: 0, found: 0, missing: 0, failed: 0, tex: st.texStats, terrain: '' };
+  setAssetStatus();
+  try {
+    await st.init(); if (gen !== S.assetGen) return;
+    const tt = await bakeTerrain(st, gen); if (gen !== S.assetGen) { tt && tt.dispose(); return; }
+    if (tt) { S.terTex = tt; terrainDirty = true; scheduleRealRebuild(true); }
+    // road materials
+    const roadNames = new Set(S.objs.filter(o => o.cls === 'DecalRoad' && o.r.material).map(o => o.r.material));
+    for (const nm of roadNames) {
+      const def = st.mats.find(nm); if (!def || !def.colorMap) continue;
+      const tex = await st.texture(def.colorMap, [def.dir, levelRoot(S.groups[0].path)]);
+      if (gen !== S.assetGen) return;
+      if (tex) S.roadMats.set(nm, { tex, def });
+    }
+    if (S.roadMats.size) scheduleRealRebuild();
+    for (const [ref, bases] of refs) {
+      const res = await st.shape(ref, bases);
+      if (gen !== S.assetGen) return;
+      S.astat.done++;
+      if (!res) S.astat.missing++;
+      else if (res.error) { S.astat.failed++; console.warn('dae', ref, res.error); }
+      else { S.astat.found++; S.shapeByName.set(ref, res); S.dae.set(ref, res.bounds); scheduleRealRebuild(); }
+      setAssetStatus();
+      await yieldUI();
+    }
+  } catch (e) { console.warn('real assets', e); }
+  if (gen !== S.assetGen) return;
+  S.astat.loading = false; setAssetStatus();
+  scheduleRealRebuild(true);
+  if (S.sel) renderSheet(true);
 }
 
 function defaultBounds(cls) {
@@ -267,7 +433,8 @@ function dl(b, name) {
 /* ---------- three.js scene ---------- */
 const cv = $('cv');
 const overlay = $('overlay');
-let renderer, scene, persp, ortho, camera, sun, hemi, terrainMesh, objGroup, gridMesh;
+let renderer, scene, persp, ortho, camera, sun, hemi, terrainMesh, objGroup, realGroup, gridMesh;
+const SKY_HORIZON = 0xb9cde0;
 const raycaster = new THREE.Raycaster();
 const _ndc = new THREE.Vector2();
 const _v = new THREE.Vector3();
@@ -277,34 +444,44 @@ let viewW = 1, viewH = 1, dpr = 1, needRender = true;
 
 function initThree() {
   renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true, alpha: false, powerPreference: 'high-performance' });
-  renderer.setClearColor(0x0b0f14, 1);
+  renderer.setClearColor(SKY_HORIZON, 1);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   scene = new THREE.Scene();
-  scene.fog = new THREE.Fog(0x0b0f14, 200, 600);
+  scene.background = skyTexture();
+  scene.fog = new THREE.Fog(SKY_HORIZON, 200, 600);
   persp = new THREE.PerspectiveCamera(50, 1, 0.3, 4000);
   persp.up.set(0, 0, 1);
   ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.3, 4000);
   ortho.up.set(0, 1, 0);
   camera = persp;
-  hemi = new THREE.HemisphereLight(0xc5d6ea, 0x3a2a18, 0.9);
+  hemi = new THREE.HemisphereLight(0xd6e6ff, 0x4a3f30, 1.15);
   hemi.position.set(0, 0, 1);
   scene.add(hemi);
-  sun = new THREE.DirectionalLight(0xfff2d6, 1.05);
-  sun.position.set(-80, -40, 120);
+  sun = new THREE.DirectionalLight(0xfff0d8, 2.1);
+  sun.position.set(-60, -90, 110);
   scene.add(sun);
-  scene.add(new THREE.AmbientLight(0x406080, 0.25));
+  scene.add(new THREE.AmbientLight(0x8090a0, 0.25));
   objGroup = new THREE.Group();
   scene.add(objGroup);
+  realGroup = new THREE.Group();
+  scene.add(realGroup);
   resize();
   new ResizeObserver(() => resize()).observe($('stage'));
   addEventListener('resize', () => setTimeout(resize, 50));
   loop();
 }
+function skyTexture() {
+  const c = document.createElement('canvas'); c.width = 4; c.height = 256;
+  const g = c.getContext('2d'); const gr = g.createLinearGradient(0, 0, 0, 256);
+  gr.addColorStop(0, '#4f86c6'); gr.addColorStop(0.55, '#9fc0e2'); gr.addColorStop(1, '#' + SKY_HORIZON.toString(16));
+  g.fillStyle = gr; g.fillRect(0, 0, 4, 256);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
 function resize() {
   if (!renderer) return;
   const r = $('stage').getBoundingClientRect();
   viewW = Math.max(1, r.width); viewH = Math.max(1, r.height);
-  dpr = Math.min(window.devicePixelRatio || 1, 3);
+  dpr = Math.min(window.devicePixelRatio || 1, isPhone() ? 2 : 3);
   renderer.setPixelRatio(dpr);
   renderer.setSize(viewW, viewH, false);
   persp.aspect = viewW / viewH; persp.updateProjectionMatrix();
@@ -314,7 +491,7 @@ function updateCamera() {
   const t = camState.target;
   if (scene.fog) {
     if (S.mode === '2d') { scene.fog.near = 4000; scene.fog.far = 8000; }
-    else { scene.fog.near = camState.dist * 2.2; scene.fog.far = camState.dist * 8; }
+    else { scene.fog.near = camState.dist * 2.5; scene.fog.far = camState.dist * 9; }
   }
   if (S.mode === '2d') {
     camera = ortho;
@@ -416,7 +593,9 @@ function applyTRS(mesh, r, extraZ = 0) {
 
 function makeTerrain() {
   if (terrainMesh) { scene.remove(terrainMesh); terrainMesh.geometry.dispose(); terrainMesh.material.dispose(); terrainMesh = null; }
+  terrainDirty = false;
   const t = T(); if (!t) return;
+  const L = S.ter.layer, lay = S.terLayers;
   const phone = Math.min(viewW, viewH) < 700 || coarse;
   const maxN = phone ? 192 : 256;
   const n = Math.min(t.size, maxN);
@@ -434,16 +613,24 @@ function makeTerrain() {
     const y = t.py + (j / (n - 1)) * t.ext;
     const z = heightAt(x, y);
     pos.setXYZ(idx, x, y, z);
-    const u = (S.ter.hm[Math.min(t.size - 1, ((j / (n - 1)) * (t.size - 1)) | 0) * t.size + Math.min(t.size - 1, ((i / (n - 1)) * (t.size - 1)) | 0)] - lo) / rg;
-    const sh = 0.45 + 0.55 * u;
-    col[idx * 3] = (60 + u * 120) / 255 * sh;
-    col[idx * 3 + 1] = (90 + u * 90) / 255 * sh;
-    col[idx * 3 + 2] = (55 + u * 60) / 255 * sh;
+    geo.attributes.uv.setXY(idx, i / (n - 1), j / (n - 1));
+    const si = Math.min(t.size - 1, ((j / (n - 1)) * (t.size - 1)) | 0) * t.size + Math.min(t.size - 1, ((i / (n - 1)) * (t.size - 1)) | 0);
+    if (L && !S.terTex) { // quick per-layer colours until textures are baked
+      const ly = L[si]; const c = ly === 255 ? [0.35, 0.35, 0.35] : (lay && lay[ly] ? lay[ly].avg : guessColor((S.ter.mats[ly] || ''), ly));
+      col[idx * 3] = c[0]; col[idx * 3 + 1] = c[1]; col[idx * 3 + 2] = c[2];
+    } else {
+      const u = (S.ter.hm[si] - lo) / rg;
+      const sh = 0.55 + 0.45 * u;
+      col[idx * 3] = (70 + u * 110) / 255 * sh;
+      col[idx * 3 + 1] = (100 + u * 80) / 255 * sh;
+      col[idx * 3 + 2] = (60 + u * 50) / 255 * sh;
+    }
   }
   geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
   geo.computeVertexNormals();
   geo.computeBoundingSphere();
-  const mat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  const mat = S.terTex ? new THREE.MeshLambertMaterial({ map: S.terTex, side: THREE.DoubleSide })
+    : new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
   terrainMesh = new THREE.Mesh(geo, mat);
   terrainMesh.receiveShadow = false;
   terrainMesh.matrixAutoUpdate = true;
@@ -458,11 +645,20 @@ function boxGeoFrom(b) {
   return geo;
 }
 
+const PROXY_MAT = new THREE.MeshBasicMaterial({ visible: false });
+const SEL_EDGE = new THREE.LineBasicMaterial({ color: 0xf97316, transparent: true, opacity: 0.85, depthTest: false });
+PROXY_MAT.userData.shared = SEL_EDGE.userData.shared = true;
 function makeObjectMesh(o) {
   const col = COL[o.cls] || 0x94a3b8;
   if (o.cls === 'DecalRoad') return makeRoadMesh(o);
   let mesh;
-  if (o.cls === 'TSStatic' || o.cls === 'Prefab' || o.cls === 'BeamNGVehicle') {
+  const real = S.shapeByName.get(shapeRef(o));
+  if (real) {
+    // the real mesh is drawn by an instanced batch; this box is the pick proxy and the selection hint
+    if (!real.proxyGeo) { real.proxyGeo = boxGeoFrom(real.bounds); real.proxyGeo.userData.shared = true; }
+    mesh = new THREE.Mesh(real.proxyGeo, PROXY_MAT);
+    mesh.userData.real = real;
+  } else if (o.cls === 'TSStatic' || o.cls === 'Prefab' || o.cls === 'BeamNGVehicle') {
     const geo = boxGeoFrom(boundsOf(o));
     const mat = new THREE.MeshLambertMaterial({ color: col, transparent: true, opacity: 0.88 });
     mesh = new THREE.Mesh(geo, mat);
@@ -512,7 +708,7 @@ function roadGeometry(o) {
     let dx = p1[0] - p0[0], dy = p1[1] - p0[1], L = Math.hypot(dx, dy) || 1;
     dx /= L; dy /= L;
     const w = (p[2] || 4) / 2;
-    const z = heightAt(p[0], p[1]) + 0.08;
+    const z = (S.ter ? heightAt(p[0], p[1]) : (p[3] || 0)) + 0.08;
     left.push(p[0] - dy * w, p[1] + dx * w, z);
     right.push(p[0] + dy * w, p[1] - dx * w, z);
   }
@@ -525,13 +721,23 @@ function roadGeometry(o) {
     const a = i * 2, b = i * 2 + 1, c = i * 2 + 2, d = i * 2 + 3;
     idx.push(a, b, c, b, d, c);
   }
+  const uv = new Float32Array(pts.length * 4), tl = +o.r.textureLength || 5;
+  let run = 0;
+  for (let i = 0; i < pts.length; i++) {
+    if (i) run += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    uv.set([0, run / tl, 1, run / tl], i * 4);
+  }
+  geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setIndex(idx);
   geo.computeVertexNormals();
   return geo;
 }
 function makeRoadMesh(o) {
-  const mat = new THREE.MeshLambertMaterial({ color: COL.DecalRoad, transparent: true, opacity: 0.92, side: THREE.DoubleSide });
+  const rm = S.roadMats.get(o.r.material);
+  const mat = rm
+    ? new THREE.MeshLambertMaterial({ map: rm.tex, color: 0xffffff, transparent: true, opacity: 1, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })
+    : new THREE.MeshLambertMaterial({ color: 0x45484e, transparent: true, opacity: 0.95, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 });
   const mesh = new THREE.Mesh(roadGeometry(o), mat);
   mesh.userData.obj = o;
   mesh.matrixAutoUpdate = true;
@@ -544,14 +750,15 @@ function rebuildMeshes() {
     objGroup.traverse(ch => keep.push(ch));
     objGroup.clear();
     for (const ch of keep) {
-      if (ch.geometry) ch.geometry.dispose();
+      if (ch.geometry && !ch.geometry.userData.shared) ch.geometry.dispose();
       if (ch.material) {
         const ms = Array.isArray(ch.material) ? ch.material : [ch.material];
-        ms.forEach(m => m.dispose?.());
+        ms.forEach(m => { if (!m.userData.shared) m.dispose?.(); });
       }
     }
   }
-  makeTerrain();
+  if (realGroup) { for (const b of [...realGroup.children]) { realGroup.remove(b); b.dispose?.(); } }
+  if (terrainDirty || !terrainMesh) makeTerrain();
   if (gridMesh) { scene.remove(gridMesh); gridMesh = null; }
   if (S.show.grid) {
     const t = T(); const span = t ? t.ext : 100;
@@ -567,17 +774,44 @@ function rebuildMeshes() {
     if (o.cls === 'DecalRoad' && !S.show.rd) continue;
     if (o.cls !== 'TSStatic' && o.cls !== 'DecalRoad' && !S.show.ot) continue;
     const m = makeObjectMesh(o);
-    o.mesh = m;
+    o.mesh = m; o.inst = null;
     objGroup.add(m);
   }
+  buildBatches();
   highlightSel();
   needRender = true;
 }
 
+function buildBatches() {
+  const by = new Map();
+  for (const o of S.objs) {
+    const real = o.mesh && o.mesh.userData.real; if (!real || !o.mesh.parent) continue;
+    if (!by.has(real)) by.set(real, []);
+    by.get(real).push(o);
+  }
+  for (const [real, list] of by) {
+    const batches = real.parts.map(pt => {
+      const im = new THREE.InstancedMesh(pt.geo, pt.mat, list.length);
+      im.frustumCulled = false; im.matrixAutoUpdate = false;
+      if (pt.mat.transparent) im.renderOrder = 2;
+      realGroup.add(im); return im;
+    });
+    list.forEach((o, i) => {
+      o.inst = { batches, i };
+      for (const b of batches) b.setMatrixAt(i, o.mesh.matrix);
+    });
+    for (const b of batches) b.instanceMatrix.needsUpdate = true;
+  }
+}
 function highlightSel() {
   for (const o of S.objs) {
     const m = o.mesh; if (!m || !m.material) continue;
     const on = o === S.sel;
+    if (m.userData.real) {
+      if (on && !m.userData.edges) { const e = new THREE.LineSegments(new THREE.EdgesGeometry(m.geometry), SEL_EDGE); m.add(e); m.userData.edges = e; }
+      if (m.userData.edges) m.userData.edges.visible = on;
+      continue;
+    }
     if (m.material.color && m.userData._base == null) m.userData._base = m.material.color.getHex();
     if (m.material.color) m.material.color.setHex(on ? 0xf97316 : m.userData._base);
     if (m.material.emissive) m.material.emissive.setHex(on ? 0x3a1404 : 0x000000);
@@ -590,7 +824,10 @@ function syncMesh(o) {
   if (o.cls === 'DecalRoad') {
     o.mesh.geometry.dispose();
     o.mesh.geometry = roadGeometry(o);
-  } else applyTRS(o.mesh, o.r);
+  } else {
+    applyTRS(o.mesh, o.r);
+    if (o.inst) for (const b of o.inst.batches) { b.setMatrixAt(o.inst.i, o.mesh.matrix); b.instanceMatrix.needsUpdate = true; }
+  }
   needRender = true;
 }
 
@@ -726,6 +963,7 @@ function setGuides(list) {
   }
   drawGuides();
 }
+function capPtr(el, id) { try { el.setPointerCapture(id); } catch (_) {} }
 function haptic() { try { navigator.vibrate?.(8); } catch {} }
 
 function pickAt(cx, cy) {
@@ -883,14 +1121,15 @@ function nearSelClient(cx, cy, mpx = 40) {
 /* ---------- context menu ---------- */
 let menuTarget = null, menuArmed = false;
 function menuOpen() { return !!menuTarget; }
-function closeMenu() { menuTarget = null; $('ctxmenu').hidden = true; }
+function closeMenu() { if (!menuTarget && $('ctxmenu').hidden) return; menuTarget = null; menuPress = null; $('ctxmenu').hidden = true; }
 function openMenu(t, ev) {
   if (!t) return; S.sel = t; menuTarget = t; highlightSel(); renderSheet();
   const m = $('ctxmenu');
   const items = menuItems(t);
-  m.innerHTML = items.map(it => `<button role="menuitem" data-act="${it.id}" class="${it.danger ? 'danger' : ''}" ${it.disabled ? 'disabled' : ''}>${esc(it.label)}</button>`).join('');
+  m.innerHTML = `<div class="mh"><span>${esc(t.r.name || t.cls)}</span><button class="mx" data-close aria-label="إغلاق القائمة">✕</button></div>` +
+    items.map(it => `<button role="menuitem" data-act="${it.id}" class="${it.danger ? 'danger' : ''}" ${it.disabled ? 'disabled' : ''}>${esc(it.label)}</button>`).join('');
   m.hidden = false; menuArmed = false;
-  const W = 176, MH = items.length * 46 + 12;
+  const W = 176, MH = items.length * 46 + 12 + 40;
   let left, top;
   const r = $('stage').getBoundingClientRect();
   const box = worldBox(t);
@@ -929,7 +1168,9 @@ function pasteSettings(o) {
 }
 $('ctxmenu').addEventListener('pointerdown', ev => { ev.stopPropagation(); menuArmed = true; });
 $('ctxmenu').addEventListener('click', ev => {
+  if (ev.target.closest('[data-close]')) { closeMenu(); return; }
   const btn = ev.target.closest('button[data-act]'); if (!btn || !menuArmed) return;
+  if (!menuTarget) { closeMenu(); return; }
   const it = menuItems(menuTarget).find(x => x.id === btn.dataset.act);
   closeMenu(); if (it && !it.disabled) it.run();
 });
@@ -956,7 +1197,7 @@ const taps = multiTap({ onTwo: doUndo, onThree: doRedo });
 /* ---------- gestures: handle > selected > camera ---------- */
 const pts = new Map();
 let cand = null, drag = null, pull = null, pinch = null, press = 0;
-let lastThingTap = null, lastTap = null, pendingMenu = 0, pendingSheet = 0, swallow = false;
+let lastThingTap = null, lastTap = null, pendingMenu = 0, pendingSheet = 0, swallow = false, dismissTap = null, menuPress = null;
 let lastType = 'mouse', orbitVel = { y: 0, p: 0 }, fly = 0;
 const claimed = new Set();
 
@@ -988,7 +1229,7 @@ function onDown(ev) {
     drag = null; pull = null; cand = null;
     if (onIt) {
       claimed.add(ev.pointerId);
-      overlay.setPointerCapture?.(ev.pointerId);
+      capPtr(overlay, ev.pointerId);
       beginEdit();
       pinch = { resize: true, o: t, a0: a, b0: b, start: snapshotOf(t), live: false };
     } else {
@@ -1001,7 +1242,7 @@ function onDown(ev) {
   const hd = ev.target.closest?.('[data-handle]');
   if (hd && S.sel) {
     claimed.add(ev.pointerId);
-    ev.target.setPointerCapture?.(ev.pointerId);
+    capPtr(ev.target, ev.pointerId);
     const h = hd.dataset.handle;
     if (h.startsWith('node-')) {
       S.selNode = +h.slice(5);
@@ -1017,7 +1258,7 @@ function onDown(ev) {
   const t = (S.sel && nearSelClient(ev.clientX, ev.clientY, coarse ? 14 : 4)) ? S.sel : pickAt(ev.clientX, ev.clientY);
   if (t && t === S.sel) {
     claimed.add(ev.pointerId);
-    cv.setPointerCapture?.(ev.pointerId);
+    capPtr(cv, ev.pointerId);
     let node = -1;
     if (t.cls === 'DecalRoad') {
       const n = t.r.nodes || []; const k = pxPerMeter(t);
@@ -1030,13 +1271,13 @@ function onDown(ev) {
     S.selNode = node;
     drag = { o: t, node, start: snapshotOf(t), sx: ev.clientX, sy: ev.clientY, hit: hitTerrainAt(ev.clientX, ev.clientY), live: ev.pointerType === 'mouse', was: true, moved: false };
     beginEdit();
-    if (!drag.live) press = setTimeout(() => { if (drag && !drag.moved && pts.size === 1) { const tt = drag.o; drag = null; endEdit(); openMenu(tt); } }, 500);
+    if (!drag.live) press = setTimeout(() => { if (drag && !drag.moved && pts.size === 1) { const tt = drag.o; menuPress = { id: ev.pointerId, x: drag.sx, y: drag.sy }; drag = null; endEdit(); openMenu(tt); haptic(); } }, 500);
     return;
   }
 
   cand = { t, id: ev.pointerId, sx: ev.clientX, sy: ev.clientY, at: performance.now(), moved: false };
   if (t && ev.pointerType !== 'touch' && ev.pointerType !== 'pen' && ev.pointerType !== 'mouse') { /* noop */ }
-  if (t && ev.pointerType !== 'mouse') press = setTimeout(() => { if (cand && cand.t && !cand.moved && pts.size === 1) { const tt = cand.t; cand = null; openMenu(tt); } }, 500);
+  if (t && ev.pointerType !== 'mouse') press = setTimeout(() => { if (cand && cand.t && !cand.moved && pts.size === 1) { const tt = cand.t; menuPress = { id: cand.id, x: cand.sx, y: cand.sy }; cand = null; openMenu(tt); haptic(); } }, 500);
 }
 
 function onMove(ev) {
@@ -1044,6 +1285,7 @@ function onMove(ev) {
   const prev = pts.get(ev.pointerId);
   pts.set(ev.pointerId, [ev.clientX, ev.clientY]);
   taps.move(ev);
+  if (menuOpen() && menuPress && menuPress.id === ev.pointerId && Math.hypot(ev.clientX - menuPress.x, ev.clientY - menuPress.y) > 14) { closeMenu(); menuPress = null; }
   if (cand && ev.pointerId === cand.id && Math.hypot(ev.clientX - cand.sx, ev.clientY - cand.sy) > (ev.pointerType === 'touch' ? 10 : 4)) {
     cand.moved = true; clearTimeout(press);
   }
@@ -1162,6 +1404,7 @@ function onUp(ev) {
     const c = cand; cand = null;
     // inertia
     if (c.moved && S.mode === '3d' && Math.hypot(orbitVel.y, orbitVel.p) > 0.02) startGlide();
+    if (!c.moved && c.id === dismissTap) { dismissTap = null; done(); return; } // this tap only closed the menu
     if (!c.moved && ev.type === 'pointerup' && !pts.size && performance.now() - c.at < 600) {
       const now = Date.now();
       if (S.adding) {
@@ -1188,16 +1431,14 @@ function onUp(ev) {
 
   if (pinch) { if (pts.size < 2) pinch = null; done(); return; }
 
+  if (drag && !drag.moved && ev.type === 'pointerup' && dismissTap === ev.pointerId) { dismissTap = null; drag = null; done(); updateOverlay(); render(); return; }
   if (drag && !drag.moved && ev.type === 'pointerup') {
     const t = drag.o, now = Date.now();
     if (lastThingTap && lastThingTap.t === t && now - lastThingTap.at < 320) {
       clearTimeout(pendingMenu); clearTimeout(pendingSheet); lastThingTap = null; focusObj(t);
     } else {
       lastThingTap = { t, at: now };
-      if (drag.was && lastType !== 'mouse') {
-        clearTimeout(pendingMenu);
-        pendingMenu = setTimeout(() => { if (!pts.size) openMenu(t); }, 330);
-      }
+      // a tap only selects; the menu is long-press (0.5s) or right-click
       openDockForSel();
     }
   }
@@ -1220,7 +1461,7 @@ function startGlide() {
 }
 
 function onWheel(ev) {
-  ev.preventDefault();
+  ev.preventDefault(); closeMenu();
   const f = ev.deltaY < 0 ? 0.9 : 1.1;
   if (S.mode === '2d') camState.ortho = clamp(camState.ortho * f, 4, 4000);
   else camState.dist = clamp(camState.dist * f, 4, 4000);
@@ -1232,9 +1473,13 @@ function onContext(ev) {
   if (t) openMenu(t); else closeMenu();
 }
 
+// Any touch outside the menu closes it. A plain tap that closed the menu does nothing else,
+// but a drag / pinch / orbit that starts there carries on normally.
 document.addEventListener('pointerdown', ev => {
-  if (menuOpen() && !ev.target.closest?.('.ctxmenu')) { closeMenu(); swallow = ev.target.closest?.('#stage'); }
+  if (menuOpen() && !ev.target.closest?.('.ctxmenu')) { closeMenu(); dismissTap = ev.target.closest?.('#stage') ? ev.pointerId : null; }
+  else if (!menuOpen()) dismissTap = null;
 }, true);
+addEventListener('keydown', ev => { if (ev.key === 'Escape' && menuOpen()) { ev.preventDefault(); closeMenu(); } });
 
 const stage = $('stage');
 stage.addEventListener('pointerdown', onDown);
@@ -1392,6 +1637,7 @@ function bindSheet() {
   sh.querySelector('#sFocus')?.addEventListener('click', () => focusObj(S.sel));
   sh.querySelectorAll('[data-f]').forEach(el => el.addEventListener('change', () => {
     if (!S.sel) return; beginEdit(); markGesture(); S.sel.r[el.dataset.f] = el.value; dirty(S.sel.r); endEdit(); syncMesh(S.sel); render();
+    if (el.dataset.f === 'shapeName' || el.dataset.f === 'shapeFile') ensureShape(S.sel); else if (el.dataset.f === 'material' && S.sel.cls === 'DecalRoad') rebuildMeshes();
   }));
   sh.querySelectorAll('[data-pos]').forEach(el => el.addEventListener('change', () => {
     if (!S.sel) return; beginEdit(); markGesture(); S.sel.r.position[+el.dataset.pos] = +el.value; dirty(S.sel.r); endEdit(); syncMesh(S.sel); updateOverlay(); render();
@@ -1456,6 +1702,7 @@ function hud() {
   if (t) s += `<br>تضاريس <span class="n">${t.ext.toFixed(0)}×${t.ext.toFixed(0)} م</span> · خلية <span class="n">${t.sq}</span> · <span class="n">${t.size}px</span>`;
   if (S.sel) s += `<br>${esc(S.sel.cls)} — ${esc(S.sel.r.name || '')}`;
   $('hud').innerHTML = s;
+  placeStatus();
 }
 function render() {
   needRender = true;
@@ -1547,6 +1794,14 @@ async function loadDemo() {
       const res = await fetch('testdata/level.zip');
       if (res.ok) { const blob = await res.blob(); await loadFiles([new File([blob], 'level.zip')]); return; }
     } catch (_) {}
+    try { // text copy of the same zip (the site is published from text files)
+      const res = await fetch('testdata/level.zip.b64');
+      if (res.ok) {
+        const bin = atob((await res.text()).replace(/\s+/g, ''));
+        const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        await loadFiles([new File([u8], 'level.zip')]); return;
+      }
+    } catch (_) {}
     await loadFiles(buildDemoFiles());
   } catch (e) { if (msg) msg.textContent = 'خطأ: ' + e.message; }
 }
@@ -1575,6 +1830,11 @@ window.__test = {
   bounds: i => S.objs[i] && boundsOf(S.objs[i]),
   worldBox: i => S.objs[i] && worldBox(S.objs[i]),
   menuOpen: () => menuOpen(),
+  assets: () => S.astat && { ...S.astat, tex: { ...S.astat.tex }, shapes: [...S.shapeByName.keys()], batches: realGroup.children.length, terTex: !!S.terTex, roadMats: [...S.roadMats.keys()] },
+  ready: () => !!S.astat && !S.astat.loading,
+  setCam: c => { cancelAnimationFrame(fly); if (c.target) camState.target.set(...c.target); for (const k of ['dist', 'yaw', 'pitch', 'ortho']) if (c[k] != null) camState[k] = c[k]; updateCamera(); render(); },
+  info: () => ({ calls: renderer.info.render.calls, tris: renderer.info.render.triangles, geos: renderer.info.memory.geometries, texs: renderer.info.memory.textures, dpr }),
+  pick: (x, y) => { const o = pickAt(x, y); return o ? S.objs.indexOf(o) : -1; },
   openMenu: i => openMenu(S.objs[i]),
   closeMenu
 };
