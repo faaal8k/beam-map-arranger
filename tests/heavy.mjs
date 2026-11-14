@@ -1,0 +1,23 @@
+// Load a heavy synthetic level (tools/make_demo.py --heavy /tmp/heavy-level.zip) and report timings.
+import pkg from '/tmp/node_modules/playwright-core/index.js';
+const browser = await pkg.chromium.launch({ channel: 'chrome', args: ['--no-sandbox', '--use-gl=angle', '--use-angle=swiftshader-webgl', '--enable-unsafe-swiftshader'] });
+const ctx = await browser.newContext({ viewport: { width: 430, height: 932 }, deviceScaleFactor: 3, hasTouch: true, isMobile: true });
+const page = await ctx.newPage();
+page.on('pageerror', e => console.log('PAGEERROR', e.message));
+await page.goto(process.env.URL || 'http://127.0.0.1:8765/');
+const t0 = Date.now();
+await page.setInputFiles('#fi', process.env.ZIP || '/tmp/heavy-level.zip');
+await page.waitForFunction(() => document.getElementById('intro').style.display === 'none', null, { timeout: 120000 });
+console.log('boxes visible after', Date.now() - t0, 'ms');
+await page.waitForFunction(() => window.__test?.ready(), null, { timeout: 300000 });
+console.log('real look ready after', Date.now() - t0, 'ms');
+console.log(JSON.stringify(await page.evaluate(() => window.__test.assets())));
+await page.waitForTimeout(500);
+console.log(JSON.stringify(await page.evaluate(() => window.__test.info())), 'objs', await page.evaluate(() => window.__S.objs.length));
+const fps = await page.evaluate(() => new Promise(res => { let n = 0; const t = performance.now(); const f = () => { window.__test.setCam({ yaw: window.__test.cam().yaw + 0.01 }); if (++n < 40) requestAnimationFrame(f); else res(40000 / (performance.now() - t)); }; requestAnimationFrame(f); }));
+console.log('fps (software GL)', fps.toFixed(1));
+const t1 = Date.now(); await page.evaluate(() => window.__test.undo && window.__S.objs.length && (window.__test.select(5), true));
+const sp = await page.evaluate(() => window.__test.screenOf(5));
+console.log('pick at obj5', await page.evaluate(([x, y]) => window.__test.pick(x, y), sp), 'ms', Date.now() - t1);
+await page.screenshot({ path: '/workspace/beam-shots/real-heavy-chromium.png' });
+await browser.close();
