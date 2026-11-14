@@ -91,6 +91,15 @@ h4{margin:12px 0 4px;color:var(--sf);font-size:12.5px;font-weight:600}
 .ctxmenu button:active,.ctxmenu button:hover{background:#eef2f7}
 .ctxmenu button:disabled{color:#a0a7b4}
 .ctxmenu button.danger{color:#dc2626}
+.ctxmenu .mh{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:0 4px 4px 2px;border-bottom:1px solid #e5e9f0;margin-bottom:2px}
+.ctxmenu .mh span{font-size:13px;color:#5b6475;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:8px}
+.ctxmenu .mh .mx{min-height:36px;width:36px;flex:0 0 36px;padding:0;text-align:center;font-size:17px;border-radius:999px;background:#eef2f7;color:#1f2430}
+#assetStatus{position:absolute;left:calc(8px + var(--safe-l));top:calc(70px + var(--safe-t));max-width:78%;
+  background:#000b;color:#e8eef7;border-radius:10px;padding:5px 9px;font-size:11px;line-height:1.5;direction:rtl;text-align:right;
+  pointer-events:none;z-index:3}
+#assetStatus .n{direction:ltr;unicode-bidi:isolate;display:inline-block}
+#assetStatus .spin{display:inline-block;width:9px;height:9px;border:2px solid #fff6;border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-1px}
+@keyframes spin{to{transform:rotate(360deg)}}
 
 @media (min-width:900px){
   #dock{max-width:480px;right:auto;left:0;border-right:1px solid var(--ln)}
