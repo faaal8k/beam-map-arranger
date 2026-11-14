@@ -1,23 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
-  <asset>
-    <unit meter="1" name="meter"/>
-    <up_axis>Z_UP</up_axis>
-  </asset>
-  <library_geometries>
-    <geometry id="box">
-      <mesh>
-        <source id="box-positions-src">
-          <float_array id="box-positions" count="24">-1 -1 0 1 -1 0 1 1 0 -1 1 0 -1 -1 2 1 -1 2 1 1 2 -1 1 2</float_array>
-          <technique_common>
-            <accessor source="#box-positions" count="8" stride="3">
-              <param name="X" type="float"/>
-              <param name="Y" type="float"/>
-              <param name="Z" type="float"/>
-            </accessor>
-          </technique_common>
-        </source>
-      </mesh>
-    </geometry>
-  </library_geometries>
-</COLLADA>
+<asset><unit meter="1" name="meter"/><up_axis>Z_UP</up_axis></asset>
+<library_images><image id="crate_wood-img" name="crate_wood-img"><init_from>crate_wood.png</init_from></image></library_images>
+<library_effects>
+<effect id="crate_wood-effect"><profile_COMMON><newparam sid="crate_wood-surf"><surface type="2D"><init_from>crate_wood-img</init_from></surface></newparam><newparam sid="crate_wood-samp"><sampler2D><source>crate_wood-surf</source></sampler2D></newparam><technique sid="common"><lambert><diffuse><texture texture="crate_wood-samp" texcoord="UVMap"/></diffuse></lambert></technique></profile_COMMON></effect>
+</library_effects><library_materials>
+<material id="crate_wood" name="crate_wood"><instance_effect url="#crate_wood-effect"/></material>
+</library_materials><library_geometries>
+<geometry id="crate-mesh" name="crate-mesh"><mesh>
+<source id="crate-mesh-pos"><float_array id="crate-mesh-pos-arr" count="108">-1 -1 0 1 -1 0 1 -1 2 -1 -1 0 1 -1 2 -1 -1 2 1 1 0 -1 1 0 -1 1 2 1 1 0 -1 1 2 1 1 2 1 -1 0 1 1 0 1 1 2 1 -1 0 1 1 2 1 -1 2 -1 1 0 -1 -1 0 -1 -1 2 -1 1 0 -1 -1 2 -1 1 2 -1 -1 2 1 -1 2 1 1 2 -1 -1 2 1 1 2 -1 1 2 -1 1 0 1 1 0 1 -1 0 -1 1 0 1 -1 0 -1 -1 0</float_array><technique_common><accessor source="#crate-mesh-pos-arr" count="36" stride="3"><param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/></accessor></technique_common></source>
+<source id="crate-mesh-nor"><float_array id="crate-mesh-nor-arr" count="108">0 -1 0 0 -1 0 0 -1 0 0 -1 0 0 -1 0 0 -1 0 0 1 0 0 1 0 0 1 0 0 1 0 0 1 0 0 1 0 1 0 0 1 0 0 1 0 0 1 0 0 1 0 0 1 0 0 -1 0 0 -1 0 0 -1 0 0 -1 0 0 -1 0 0 -1 0 0 0 0 1 0 0 1 0 0 1 0 0 1 0 0 1 0 0 1 0 0 -1 0 0 -1 0 0 -1 0 0 -1 0 0 -1 0 0 -1</float_array><technique_common><accessor source="#crate-mesh-nor-arr" count="36" stride="3"><param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/></accessor></technique_common></source>
+<source id="crate-mesh-uv"><float_array id="crate-mesh-uv-arr" count="72">0 0 1 0 1 1 0 0 1 1 0 1 0 0 1 0 1 1 0 0 1 1 0 1 0 0 1 0 1 1 0 0 1 1 0 1 0 0 1 0 1 1 0 0 1 1 0 1 0 0 1 0 1 1 0 0 1 1 0 1 0 0 1 0 1 1 0 0 1 1 0 1</float_array><technique_common><accessor source="#crate-mesh-uv-arr" count="36" stride="2"><param name="S" type="float"/><param name="T" type="float"/></accessor></technique_common></source>
+<vertices id="crate-mesh-vtx"><input semantic="POSITION" source="#crate-mesh-pos"/></vertices>
+<triangles material="crate_wood" count="12"><input semantic="VERTEX" source="#crate-mesh-vtx" offset="0"/><input semantic="NORMAL" source="#crate-mesh-nor" offset="0"/><input semantic="TEXCOORD" source="#crate-mesh-uv" offset="0" set="0"/><p>0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35</p></triangles>
+</mesh></geometry>
+</library_geometries><library_visual_scenes><visual_scene id="Scene" name="Scene">
+<node id="crate" name="crate" type="NODE"><instance_geometry url="#crate-mesh"><bind_material><technique_common><instance_material symbol="crate_wood" target="#crate_wood"/></technique_common></bind_material></instance_geometry></node>
+</visual_scene></library_visual_scenes><scene><instance_visual_scene url="#Scene"/></scene></COLLADA>
